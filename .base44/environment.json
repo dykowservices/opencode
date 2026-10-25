@@ -1,0 +1,7 @@
+{
+  "previewPort": 3000,
+  "healthPath": "/",
+  "startCommand": "docker compose -f docker-compose.base44.yml up -d",
+  "notes": "API serves on internal port 4096 only (proxy targets http://api:4096); logs land in /tmp/base44-logs. vite-dev.ts is the committed wrapper that loads packages/app/vite.config.ts and adds the preview-only same-origin /api and /auth proxy gated on BASE44_PREVIEW_MODE=1. OPENCODE_SERVER_PASSWORD is a local dev credential for the compose API/web pair.",
+  "secrets": []
+}

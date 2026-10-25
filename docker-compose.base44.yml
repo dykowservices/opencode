@@ -1,0 +1,116 @@
+name: app
+
+x-bun: &bun
+  image: oven/bun:1.4.2
+  user: root
+  working_dir: /workspace
+  restart: on-failure
+
+x-logs: &logs
+  - /tmp/base44-logs:/logs
+
+volumes:
+  app-node-modules:
+
+services:
+  # One-shot dependency install into the shared named volume. Self-heals the case where the
+  # source tree was recreated while the root dependency volume survived: bun install reports
+  # "no changes" and never restores the per-package links, so the volume is wiped and
+  # reinstalled from the lockfile. No shell "$" in this file - Compose interpolates it.
+  install:
+    <<: *bun
+    restart: "no"
+    environment:
+      HOME: /root
+    volumes:
+      - /app:/workspace
+      - app-node-modules:/workspace/node_modules
+      - /tmp/base44-logs:/logs
+    command:
+      - sh
+      - -ec
+      - |
+        set -eu
+        mkdir -p /logs
+        { echo '=== install'; date -u; bun --version; } >> /logs/install.log 2>&1
+        links_missing=0
+        for d in /workspace/packages/*/ /workspace/packages/plugins/*/ /workspace/services/*/; do
+          [ -f "$$d/package.json" ] || continue
+          [ -d "$$d/node_modules" ] || links_missing=1
+        done
+        if [ "$$links_missing" = 1 ]; then
+          echo WORKSPACE_LINKS_MISSING >> /logs/install.log
+          find /workspace/node_modules -mindepth 1 -delete
+          bun install --frozen-lockfile --ignore-scripts >> /logs/install.log 2>&1 || { echo INSTALL_FAILED >> /logs/install.log; exit 1; }
+        fi
+        missing=0
+        for d in /workspace/packages/*/ /workspace/packages/plugins/*/ /workspace/services/*/; do
+          [ -f "$$d/package.json" ] || continue
+          [ -d "$$d/node_modules" ] || { missing=1; echo STILL_MISSING_LINK $$d >> /logs/install.log; }
+        done
+        [ "$$missing" = 0 ] || { echo LINKS_FAILED >> /logs/install.log; exit 1; }
+        echo LINKS_OK >> /logs/install.log
+
+  # API server. CRITICAL: working_dir must be packages/cli - Bun's JSX transform follows the
+  # cwd tsconfig (root = react-jsx) and the server dies with
+  # "Cannot find module 'react/jsx-dev-runtime'" when started from the repo root.
+  api:
+    <<: *bun
+    working_dir: /workspace/packages/cli
+    depends_on:
+      install:
+        condition: service_completed_successfully
+    environment:
+      OPENCODE_SERVER_PASSWORD: devpassword
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+      HOME: /root
+      XDG_CONFIG_HOME: /root/.config
+    volumes:
+      - /app:/workspace
+      - app-node-modules:/workspace/node_modules
+      - /tmp/base44-logs:/logs
+    command:
+      - sh
+      - -ec
+      - |
+        bun src/index.ts serve --hostname 0.0.0.0 --port 4096 2>&1 | tee -a /logs/api.log
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://127.0.0.1:4096/api/event', {headers: {authorization: 'Basic ' + Buffer.from('opencode:' + process.env.OPENCODE_SERVER_PASSWORD ?? '').toString('base64')}}); await r.body?.cancel(); process.exit(r.status === 200 ? 0 : 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # Web dev server on the single public port 3000, with the repo's own vite config loaded
+  # through the wrapper plus a same-origin /api and /auth proxy.
+  web:
+    <<: *bun
+    working_dir: /workspace/packages/app
+    depends_on:
+      install:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+    environment:
+      HOME: /root
+      OPENCODE_API_TARGET: http://api:4096
+      OPENCODE_SERVER_PASSWORD: devpassword
+      BASE44_PREVIEW_MODE: "1"
+    ports:
+      - "3000:3000"
+    volumes:
+      - /app:/workspace
+      - app-node-modules:/workspace/node_modules
+      - /tmp/base44-logs:/logs
+      - ./vite-dev.ts:/vite-dev.ts
+    command:
+      - sh
+      - -ec
+      - |
+        bun /vite-dev.ts 2>&1 | tee -a /logs/web.log
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r = await fetch('http://127.0.0.1:3000/'); process.exit(r.status < 500 ? 0 : 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
